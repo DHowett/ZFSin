@@ -122,9 +122,127 @@ uint64_t vnop_num_vnodes = 0;
 #pragma region Prototypes
 static void zp_unpack_times(znode_t *zp, PLARGE_INTEGER pMtime, PLARGE_INTEGER pCtime, PLARGE_INTEGER pCrtime, PLARGE_INTEGER pAtime);
 static NTSTATUS zp_get_or_synthesize_reparse(znode_t *zp, PREPARSE_DATA_BUFFER pTagData, ULONG tagDataLen, PULONG pTagDataRequiredLen);
-static NTSTATUS vnode_apply_eas(struct vnode *vp, PFILE_FULL_EA_INFORMATION ea, ULONG eaLength, PULONG eaErrorOffset);
+static NTSTATUS zp_store_reparse(znode_t *zp, vattr_t *vap, PREPARSE_DATA_BUFFER reparseBuffer, ULONG reparseBufferLen);
+static NTSTATUS vnode_apply_eas(struct vnode *vp, PFILE_FULL_EA_INFORMATION ea, ULONG eaLength, PULONG pEaErrorOffset);
 static BOOLEAN vattr_apply_single_ea(vattr_t *vap, PFILE_FULL_EA_INFORMATION ea);
 #pragma endregion
+
+static NTSTATUS zp_store_reparse(znode_t *zp, vattr_t *vap, PREPARSE_DATA_BUFFER reparseBuffer, ULONG reparseBufferLen)
+{
+	if ((!vap && !zp) || !reparseBuffer || reparseBufferLen == 0) {
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	NTSTATUS Status = STATUS_NOT_IMPLEMENTED;
+
+	Status = FsRtlValidateReparsePointBuffer(reparseBufferLen, reparseBuffer);
+	if (!NT_SUCCESS(Status)) {
+		dprintf("FsRtlValidateReparsePointBuffer returned %08x\n", Status);
+		goto out;
+	}
+
+	BOOLEAN attrOnly = FALSE;
+	ULONG tag = reparseBuffer->ReparseTag;
+	dprintf("%s: storing reparse tag %08x\n", __func__, tag);
+
+	switch (tag) {
+		case IO_REPARSE_TAG_LX_FIFO:
+		case IO_REPARSE_TAG_LX_CHR:
+		case IO_REPARSE_TAG_LX_BLK:
+			attrOnly = TRUE;
+			break;
+		default:
+			// this reparse point must be stored in XA
+			break;
+	}
+
+	if (attrOnly) {
+		if (!vap) {
+			// INVALID: This reparse tag influences the type of the file,
+			// or another unchangeable attribute.
+			Status = STATUS_INVALID_STATE_TRANSITION;
+			goto out;
+		}
+
+		Status = STATUS_IO_REPARSE_TAG_NOT_HANDLED;
+		enum vtype newType = VNON;
+
+		switch (tag) {
+		case IO_REPARSE_TAG_LX_BLK:
+			newType = VBLK;
+			break;
+		case IO_REPARSE_TAG_LX_CHR:
+			newType = VCHR;
+			break;
+		case IO_REPARSE_TAG_LX_FIFO:
+			newType = VFIFO;
+			break;
+		}
+
+		if (newType != VNON) {
+			// Type was overridden by the reparse point value.
+			vap->va_type = newType;
+			vap->va_active |= AT_TYPE;
+			Status = STATUS_SUCCESS;
+		}
+
+		goto out;
+	}
+
+	if (!zp) {
+		Status = STATUS_IO_REPARSE_TAG_NOT_HANDLED;
+		goto out;
+	}
+
+	// Set flags to indicate we are a reparse point
+	zp->z_pflags |= ZFS_REPARSEPOINT;
+	zp->z_size = reparseBufferLen;
+
+	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
+
+	// Like zfs_symlink, write the data as SA attribute.
+	// Start TX and save FLAGS, SIZE and SYMLINK to disk.
+top:		
+	while(1) {
+		dmu_tx_t *tx = dmu_tx_create(zfsvfs->z_os);
+		dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
+		int err = dmu_tx_assign(tx, TXG_WAIT);
+		if (err) {
+			dmu_tx_abort(tx);
+			if (err == ERESTART)
+				continue;
+			break;
+		}
+
+		sa_bulk_attr_t bulk[3];
+		int count = 0;
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_FLAGS(zfsvfs), NULL, &zp->z_pflags, sizeof(zp->z_pflags));
+		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_SIZE(zfsvfs), NULL, &zp->z_size, sizeof(zp->z_size));
+
+		mutex_enter(&zp->z_lock);
+		if (zp->z_is_sa) {
+			SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_SYMLINK(zfsvfs), NULL, reparseBuffer, reparseBufferLen);
+		} else {
+			zfs_sa_symlink(zp, reparseBuffer, reparseBufferLen, tx);
+		}
+		mutex_exit(&zp->z_lock);
+
+		sa_bulk_update(zp->z_sa_hdl, bulk, count, tx);
+
+		dmu_tx_commit(tx);
+
+		if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
+			zil_commit(zfsvfs->z_log, 0);
+
+		Status = STATUS_SUCCESS;
+		break;
+	}
+
+out:
+	dprintf("%s: returning 0x%x\n", __func__, Status);
+
+	return Status;
+}
 
 BOOLEAN zfs_AcquireForLazyWrite(void *Context, BOOLEAN Wait)
 {
@@ -595,11 +713,10 @@ int zfs_find_dvp_vp(zfsvfs_t *zfsvfs, char *filename, int finalpartmaynotexist, 
 			uint64_t rdev;                                         \
 			VERIFY(sa_lookup(zp->z_sa_hdl, SA_ZPL_RDEV(zfsvfs),    \
 					 &rdev, sizeof(rdev)) == 0);           \
-			dev_t cmpl = zfs_cmpldev(rdev);                        \
                                                                                \
 			(flx)->LxFlags |= LX_FILE_METADATA_HAS_DEVICE_ID;      \
-			(flx)->LxDeviceIdMajor = major(cmpl);                  \
-			(flx)->LxDeviceIdMinor = minor(cmpl);                  \
+			(flx)->LxDeviceIdMajor = major(rdev);                  \
+			(flx)->LxDeviceIdMinor = minor(rdev);                  \
 		}                                                              \
                                                                                \
 		(flx)->LxMode = zp->z_mode;                                    \
@@ -1264,6 +1381,7 @@ int zfs_vnop_lookup(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo)
 		vap.va_mode = 0644;
 
 		PQUERY_ON_CREATE_ECP_CONTEXT qocContext = NULL;
+		PATOMIC_CREATE_ECP_CONTEXT atomicContext = NULL;
 		PECP_LIST ecp = NULL;
 		FsRtlGetEcpListFromIrp(Irp, &ecp);
 		if (ecp) {
@@ -1275,26 +1393,11 @@ int zfs_vnop_lookup(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo)
 					ATOMIC_CREATE_ECP_CONTEXT *atomic = (PATOMIC_CREATE_ECP_CONTEXT)ecpContext;
 					if (BooleanFlagOn(atomic->InFlags, ATOMIC_CREATE_ECP_IN_FLAG_REPARSE_POINT_SPECIFIED)
 						&& atomic->ReparseBuffer != NULL) {
-						ULONG tag = atomic->ReparseBuffer->ReparseTag;
-						enum vtype newType = VNON;
-						switch (tag) {
-						case IO_REPARSE_TAG_LX_BLK:
-							newType = VBLK;
-							break;
-						case IO_REPARSE_TAG_LX_CHR:
-							newType = VCHR;
-							break;
-						case IO_REPARSE_TAG_LX_FIFO:
-							newType = VFIFO;
-							break;
-						}
-
-						if (newType != VNON) {
-							// Type was overridden by the reparse point value.
-							vap.va_type = newType;
-
+						if (NT_SUCCESS(zp_store_reparse(NULL, &vap, atomic->ReparseBuffer, atomic->ReparseBufferLength))) {
 							SetFlag(atomic->OutFlags, ATOMIC_CREATE_ECP_OUT_FLAG_REPARSE_POINT_SET);
 							FsRtlAcknowledgeEcp(ecpContext);
+						} else {
+							atomicContext = atomic;
 						}
 					}
 				} else if (IsEqualGUID(&ecpType, &GUID_ECP_QUERY_ON_CREATE)) {
@@ -1364,6 +1467,18 @@ int zfs_vnop_lookup(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo)
 				if (Irp->AssociatedIrp.SystemBuffer) {
 					// Second pass: this will apply all EAs that are not only vattr EAs
 					vnode_apply_eas(vp, (PFILE_FULL_EA_INFORMATION)Irp->AssociatedIrp.SystemBuffer, IrpSp->Parameters.Create.EaLength, NULL);
+				}
+
+				if (atomicContext) {
+					if (BooleanFlagOn(atomicContext->InFlags, ATOMIC_CREATE_ECP_IN_FLAG_REPARSE_POINT_SPECIFIED)
+						&& atomicContext->ReparseBuffer != NULL) {
+						Status = zp_store_reparse(zp, NULL, atomicContext->ReparseBuffer, atomicContext->ReparseBufferLength);
+						if (NT_SUCCESS(Status)) {
+							SetFlag(atomicContext->OutFlags, ATOMIC_CREATE_ECP_OUT_FLAG_REPARSE_POINT_SET);
+							FsRtlAcknowledgeEcp(atomicContext);
+						}
+						// Status bubbles out.
+					}
 				}
 
 				if (qocContext) {
@@ -2247,6 +2362,33 @@ NTSTATUS ioctl_query_unique_id(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_
 	}
 }
 
+NTSTATUS ioctl_query_stable_guid(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+{
+	PMOUNTDEV_STABLE_GUID mountGuid;
+	ULONG bufferLength = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+	mount_t *zmo;
+
+	dprintf("%s: \n", __func__);
+
+	zmo = (mount_t *)DeviceObject->DeviceExtension;
+
+	if (bufferLength < sizeof(MOUNTDEV_STABLE_GUID)) {
+		Irp->IoStatus.Information = sizeof(MOUNTDEV_STABLE_GUID);
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+
+	mountGuid = (PMOUNTDEV_STABLE_GUID)Irp->AssociatedIrp.SystemBuffer;
+	RtlZeroMemory(&mountGuid->StableGuid, sizeof(mountGuid->StableGuid));
+	zfsvfs_t *zfsvfs = vfs_fsprivate(zmo);
+	if (zfsvfs) {
+		uint64_t guid = dmu_objset_fsid_guid(zfsvfs->z_os);
+		RtlCopyMemory(&mountGuid->StableGuid, &guid, sizeof(guid));
+		Irp->IoStatus.Information = sizeof(MOUNTDEV_STABLE_GUID);
+		return STATUS_SUCCESS;
+	}
+	return STATUS_NOT_FOUND;
+}
+
 NTSTATUS ioctl_mountdev_query_suggested_link_name(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
 	MOUNTDEV_SUGGESTED_LINK_NAME *linkName;
@@ -2967,6 +3109,42 @@ static NTSTATUS zp_get_or_synthesize_reparse(znode_t *zp, PREPARSE_DATA_BUFFER p
 			synthesizedTag = IO_REPARSE_TAG_LX_BLK;
 		} else if (vnode_isfifo(vp)) {
 			synthesizedTag = IO_REPARSE_TAG_LX_FIFO;
+		} else if (vnode_islnk(vp)) {
+			// oh boy.
+			int lreq = UFIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer) + (2 * 2 * zp->z_size);
+			if (pTagDataRequiredLen) *pTagDataRequiredLen = lreq;
+			pTagData->ReparseTag = IO_REPARSE_TAG_SYMLINK;
+			pTagData->ReparseDataLength = 0;
+			if (lreq <= tagDataLen) {
+				char* bf = (char*)pTagData->SymbolicLinkReparseBuffer.PathBuffer;
+				uio_t *uio;
+				uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
+				uio_addiov(uio, bf, zp->z_size);
+				zfs_readlink(vp, uio, NULL, NULL);
+				uio_free(uio);
+				for (int i = 0; i < zp->z_size; ++i) {
+					if (bf[i] == '/') bf[i] = '\\';
+				}
+				BOOLEAN abs = FALSE;
+				if (bf[0] == '\\') {
+					abs = TRUE;
+				}
+				wchar_t* subst = (wchar_t*)(bf + (2 * zp->z_size));
+				ULONG act = 0;
+				RtlUTF8ToUnicodeN(subst, (2 * zp->z_size), &act, bf, zp->z_size);
+
+				pTagData->SymbolicLinkReparseBuffer.SubstituteNameLength = act;
+				pTagData->SymbolicLinkReparseBuffer.SubstituteNameOffset = 0;
+
+				pTagData->SymbolicLinkReparseBuffer.PrintNameLength = act;
+				pTagData->SymbolicLinkReparseBuffer.PrintNameOffset = (char*)subst - bf;
+				RtlCopyMemory(bf, subst, 2 * zp->z_size);
+
+				pTagData->ReparseDataLength = lreq - REPARSE_DATA_BUFFER_HEADER_SIZE;
+				1;
+			}
+
+
 		}
 
 		if (synthesizedTag) {
@@ -3859,15 +4037,15 @@ out:
 /*
  * Apply a set of EAs to a vnode, while handling special Windows EAs that set UID/GID/Mode/rdev.
  */
-NTSTATUS vnode_apply_eas(struct vnode *vp, PFILE_FULL_EA_INFORMATION eas, ULONG eaLength, PULONG eaErrorOffset)
+NTSTATUS vnode_apply_eas(struct vnode *vp, PFILE_FULL_EA_INFORMATION eas, ULONG eaLength, PULONG pEaErrorOffset)
 {
 	if (vp == NULL || eas == NULL) return STATUS_INVALID_PARAMETER;
 
 	NTSTATUS Status = STATUS_SUCCESS;
 
 	// Optional: Check for validity if the caller wants it.
-	if (eaErrorOffset != NULL) {
-		Status = IoCheckEaBufferValidity(eas, eaLength, eaErrorOffset);
+	if (pEaErrorOffset != NULL) {
+		Status = IoCheckEaBufferValidity(eas, eaLength, pEaErrorOffset);
 		if (!NT_SUCCESS(Status)) {
 			dprintf("%s: failed validity: 0x%x\n", __func__, Status);
 			return Status;
@@ -3976,7 +4154,6 @@ NTSTATUS set_reparse_point(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCA
 	DWORD inlen = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
 	void *buffer = Irp->AssociatedIrp.SystemBuffer;
 	REPARSE_DATA_BUFFER *rdb = buffer;
-	ULONG tag;
 
 	if (!FileObject) 
 		return STATUS_INVALID_PARAMETER;
@@ -3988,60 +4165,12 @@ NTSTATUS set_reparse_point(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCA
 		return STATUS_INVALID_BUFFER_SIZE;
 	}
 
-	Status = FsRtlValidateReparsePointBuffer(inlen, rdb);
-	if (!NT_SUCCESS(Status)) {
-		dprintf("FsRtlValidateReparsePointBuffer returned %08x\n", Status);
-		goto out;
-	}
-
-	RtlCopyMemory(&tag, buffer, sizeof(ULONG));
-	dprintf("Received tag 0x%x\n", tag);
-
 	struct vnode *vp = IrpSp->FileObject->FsContext;
+
 	VN_HOLD(vp);
-	znode_t *zp = VTOZ(vp);
 
-	// Like zfs_symlink, write the data as SA attribute.
-	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
-	int err;
-	dmu_tx_t	*tx;
+	Status = zp_store_reparse(VTOZ(vp), NULL, rdb, inlen);
 
-	// Set flags to indicate we are reparse point
-	zp->z_pflags |= ZFS_REPARSEPOINT;
-
-	// Start TX and save FLAGS, SIZE and SYMLINK to disk.
-top:		
-	tx = dmu_tx_create(zfsvfs->z_os);
-	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
-	err = dmu_tx_assign(tx, TXG_WAIT);
-	if (err) {
-		dmu_tx_abort(tx);
-		if (err == ERESTART)
-			goto top;
-		goto out;
-	}
-
-	(void)sa_update(zp->z_sa_hdl, SA_ZPL_FLAGS(zfsvfs),
-		&zp->z_pflags, sizeof(zp->z_pflags), tx);
-
-	mutex_enter(&zp->z_lock);
-	if (zp->z_is_sa)
-		err = sa_update(zp->z_sa_hdl, SA_ZPL_SYMLINK(zfsvfs),
-			buffer, inlen, tx);
-	else
-		zfs_sa_symlink(zp, buffer, inlen, tx);
-	mutex_exit(&zp->z_lock);
-
-	zp->z_size = inlen;
-	(void)sa_update(zp->z_sa_hdl, SA_ZPL_SIZE(zfsvfs),
-		&zp->z_size, sizeof(zp->z_size), tx);
-
-	dmu_tx_commit(tx);
-
-	if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
-		zil_commit(zfsvfs->z_log, 0);
-
-out:
 	VN_RELE(vp);
 
 	dprintf("%s: returning 0x%x\n", __func__, Status);
@@ -5630,6 +5759,7 @@ ioctlDispatcher(
 				break;
 			case IOCTL_MOUNTDEV_QUERY_STABLE_GUID:
 				dprintf("IOCTL_MOUNTDEV_QUERY_STABLE_GUID\n");
+				Status = ioctl_query_stable_guid(DeviceObject, Irp, IrpSp);
 				break;
 			case IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME:
 				dprintf("IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME\n");
@@ -5783,6 +5913,7 @@ diskDispatcher(
 			break;
 		case IOCTL_MOUNTDEV_QUERY_STABLE_GUID:
 			dprintf("IOCTL_MOUNTDEV_QUERY_STABLE_GUID\n");
+			Status = ioctl_query_stable_guid(DeviceObject, Irp, IrpSp);
 			break;
 		case IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME:
 			dprintf("IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME\n");
@@ -6108,6 +6239,7 @@ fsDispatcher(
 			break;
 		case IOCTL_MOUNTDEV_QUERY_STABLE_GUID:
 			dprintf("IOCTL_MOUNTDEV_QUERY_STABLE_GUID\n");
+			Status = ioctl_query_stable_guid(DeviceObject, Irp, IrpSp);
 			break;
 		case IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME:
 			dprintf("IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME\n");

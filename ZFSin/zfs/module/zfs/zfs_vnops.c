@@ -2896,11 +2896,19 @@ zfs_readdir(vnode_t *vp, uio_t *uio, cred_t *cr, zfs_dirlist_t *zccb, int flags,
 				uint64_t mtime[2];
 				uint64_t ctime[2];
 				uint64_t crtime[2];
+				ULONG reparseTag = 0;
 				SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zfsvfs), NULL, &mtime, 16);
 				SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL, &ctime, 16);
 				SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CRTIME(zfsvfs), NULL, &crtime, 16);
 				sa_bulk_lookup(tzp->z_sa_hdl, bulk, count);
-				// Is it worth warning about failed lookup here?		
+				if (tzp->z_pflags & ZFS_REPARSEPOINT) {
+					uio_t *uio;
+					uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);	
+					uio_addiov(uio, &reparseTag, sizeof(reparseTag));
+					zfs_readlink(tzp->z_vnode, uio, NULL, NULL);
+					uio_free(uio);
+				}
+				// Is it worth warning about failed lookup here?
 
 				structsize = 0;
 
@@ -2918,7 +2926,7 @@ zfs_readdir(vnode_t *vp, uio_t *uio, cred_t *cr, zfs_dirlist_t *zccb, int flags,
 					TIME_UNIX_TO_WINDOWS(ctime, eodp->ChangeTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(crtime, eodp->CreationTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(tzp->z_atime, eodp->LastAccessTime.QuadPart);
-					eodp->EaSize = tzp->z_pflags & ZFS_REPARSEPOINT ? 0xa0000003 : xattr_getsize(ZTOV(tzp)); // Magic code to change dir icon to link
+					eodp->EaSize = reparseTag ? reparseTag : xattr_getsize(ZTOV(tzp)); // Magic code to change dir icon to link
 					eodp->FileAttributes = zfs_getwinflags(tzp);
 					nameptr = eodp->FileName;
 					eodp->FileNameLength = namelenholder;
@@ -2937,7 +2945,7 @@ zfs_readdir(vnode_t *vp, uio_t *uio, cred_t *cr, zfs_dirlist_t *zccb, int flags,
 					TIME_UNIX_TO_WINDOWS(ctime, fibdi->ChangeTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(crtime, fibdi->CreationTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(tzp->z_atime, fibdi->LastAccessTime.QuadPart);
-					fibdi->EaSize = tzp->z_pflags & ZFS_REPARSEPOINT ? 0xa0000003 : xattr_getsize(ZTOV(tzp));
+					fibdi->EaSize = reparseTag ? reparseTag : xattr_getsize(ZTOV(tzp));
 					fibdi->FileAttributes = zfs_getwinflags(tzp);
 					fibdi->FileId.QuadPart = objnum;
 					fibdi->FileIndex = offset;
@@ -2960,7 +2968,7 @@ zfs_readdir(vnode_t *vp, uio_t *uio, cred_t *cr, zfs_dirlist_t *zccb, int flags,
 					TIME_UNIX_TO_WINDOWS(ctime, fifdi->ChangeTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(crtime, fifdi->CreationTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(tzp->z_atime, fifdi->LastAccessTime.QuadPart);
-					fifdi->EaSize = tzp->z_pflags & ZFS_REPARSEPOINT ? 0xa0000003 : xattr_getsize(ZTOV(tzp));
+					fifdi->EaSize = reparseTag ? reparseTag : xattr_getsize(ZTOV(tzp));
 					fifdi->FileAttributes = zfs_getwinflags(tzp);
 					fifdi->FileId.QuadPart = objnum;
 					fifdi->FileIndex = offset;
@@ -2981,7 +2989,7 @@ zfs_readdir(vnode_t *vp, uio_t *uio, cred_t *cr, zfs_dirlist_t *zccb, int flags,
 					TIME_UNIX_TO_WINDOWS(ctime, fbdi->ChangeTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(crtime, fbdi->CreationTime.QuadPart);
 					TIME_UNIX_TO_WINDOWS(tzp->z_atime, fbdi->LastAccessTime.QuadPart);
-					fbdi->EaSize = tzp->z_pflags & ZFS_REPARSEPOINT ? 0xa0000003 : xattr_getsize(ZTOV(tzp));
+					fbdi->EaSize = reparseTag ? reparseTag : xattr_getsize(ZTOV(tzp));
 					fbdi->FileAttributes = zfs_getwinflags(tzp);
 					fbdi->FileIndex = offset;
 					fbdi->ShortNameLength = 0;

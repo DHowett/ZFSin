@@ -758,7 +758,7 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 			VERIFY(sa_lookup(zp->z_sa_hdl, SA_ZPL_RDEV(zfsvfs),
 			    &rdev, sizeof (rdev)) == 0);
 
-			vp->v_rdev = zfs_cmpldev(rdev);
+			vp->v_rdev = rdev;
 		}
 		break;
 #endif	/* sun */
@@ -1013,7 +1013,7 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 	}
 
 	if (vap->va_type == VBLK || vap->va_type == VCHR) {
-		rdev = zfs_expldev(vap->va_rdev);
+		rdev = vap->va_rdev;
 	}
 
 	parent = dzp->z_id;

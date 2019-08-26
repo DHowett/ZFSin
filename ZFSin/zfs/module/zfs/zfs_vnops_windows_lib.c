@@ -3044,3 +3044,8 @@ out:
 
 	return ret;
 }
+
+// DH DH DH DH DH reparse point operations
+// should-be-reparse?
+// get-reparse.
+// set-reparse.

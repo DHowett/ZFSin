@@ -357,7 +357,7 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 	    &crtime, 16);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_LINKS(zfsvfs), NULL,
 	    &zp->z_links, 8);
-	if (vnode_isblk(zp->z_vnode) || vnode_islnk(zp->z_vnode))
+	if (vnode_isblk(zp->z_vnode) || vnode_ischr(zp->z_vnode))
 		SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_RDEV(zfsvfs), NULL,
 		    &rdev, 8);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_DACL_COUNT(zfsvfs), NULL,
